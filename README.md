@@ -46,9 +46,13 @@ This is a take-home assessment focused on implementing LLM evaluation. Your task
 
 The evaluation should help assess how well the AI agent identifies policy violations in code diffs.
 
-Note: You will need your own Anthropic API key to run the code (let us know if you need help with this). Feel free to contact us for any questions you may have. :)
+Note: You will need your own Anthropic API key to run the code (let us know if you need help with this). 
+Add your key to the `src/config/settings.py` file.
+Feel free to contact us for any questions you may have. :)
 
-## Bonus
+
+
+## Bonus [Optional]
 
 We love AI coding agents. If you think you're particularly skilled at using and getting the best results from them, try using [Amp](https://ampcode.com) and [sharing your threads publicly](https://ampcode.com/manual#privacy-and-permissions) with us. We'd love to see what you come up with!
 
