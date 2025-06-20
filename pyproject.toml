@@ -1,0 +1,30 @@
+[project]
+name = "tanagram_take_home"  # Keep consistent with underscores
+version = "0.1.0"
+description = "Take-home-assessment for LLM-Evaluation"
+authors = [
+    {name = "Shivansh"}
+]
+readme = "README.md"
+requires-python = ">=3.13"
+packages = [
+    { include = "src" }
+]
+
+
+[tool.poetry.dependencies]
+litellm = [">=1.72.6.post1","<2.0.0"]
+pydantic = "^2.0.0"
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [
+    { include = "src" }
+]
+
+[tool.poetry.scripts]
+start_agent = "src.main:main"

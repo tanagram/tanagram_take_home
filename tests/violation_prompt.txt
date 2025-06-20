@@ -1,0 +1,24 @@
+POLICY: Database Migration - Non-nullable Columns on existing tables
+
+VIOLATION PATTERN:
+- Operations that add non-nullable columns without defaults to PREVIOUSLY EXISTING tables
+- Must meet ALL these conditions:
+1. Modifies a table that existed BEFORE the current migration
+2. Adds one or more new columns
+3. Makes those columns non-nullable (NOT NULL)
+4. Does not provide default values
+
+NON-VIOLATION PATTERN:
+- Adding non-nullable columns to tables created IN THE SAME MIGRATION
+- CREATE TABLE statements
+- DROP COLUMN statements
+- ADD COLUMN with nullable columns
+- ADD COLUMN with NOT NULL AND DEFAULT
+
+REASON: This policy prevents migration failures that occur when adding non-nullable columns without defaults to tables that contain existing data. Tables created in the same migration file are guaranteed to be empty when columns are added to them, so they're exempt from this policy.
+
+DETECTION LOGIC:
+1. If a CREATE TABLE and ALTER TABLE for the same table appear in the same migration file, operations on that table are exempt
+2. If only ALTER TABLE appears (indicating the table existed before), then check for violations
+3. Look specifically for the sequence of: ALTER TABLE → existing_table → ADD COLUMN → column_name → NOT NULL without DEFAULT
+4. Look for the sequence: queryRunner.addColumn → isNullable → false

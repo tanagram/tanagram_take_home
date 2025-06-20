@@ -1,0 +1,1320 @@
+diff --git a/.eslintrc b/.eslintrc
+--- a/.eslintrc
++++ b/.eslintrc
+@@ -28,6 +28,7 @@
+     "@typescript-eslint/ban-ts-ignore": "off",
+     "@typescript-eslint/no-explicit-any": "off",
+     "@typescript-eslint/camelcase": "off",
+-    "@typescript-eslint/no-use-before-define": "off"
++    "@typescript-eslint/no-use-before-define": "off",
++    "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "_" }]
+   }
+ }
+
+diff --git a/controllers/endpoints.ts b/controllers/endpoints.ts
+--- a/controllers/endpoints.ts
++++ b/controllers/endpoints.ts
+@@ -0,0 +1,226 @@
++import * as express from 'express';
++import { body, param, query } from 'express-validator/check';
++
++import { Endpoint } from '../entity/endpoints/Endpoint';
++import { EndpointRequests } from '../entity/endpoints/EndpointRequests';
++import { Model } from '../entity/models/Model';
++import { ModelPermissionMode } from '../entity/models/ModelPermission';
++import { UUID_REGEX } from '../lib/constants';
++import {
++  ErrInvalidArgument,
++  ErrorNotFound,
++  ErrorPermissionDenied,
++  Success,
++  SuccessWithBody,
++} from '../lib/responses';
++import {
++  requiresLogin,
++  toValidSubdomain,
++  validateArguments,
++} from '../lib/utils';
++
++export default () => {
++  const router = express.Router();
++
++  // Client routes
++  router.get('/v1/endpoints', requiresLogin, async (req, res) => {
++    const results = await Endpoint.GetMany({ userId: req.user.id });
++    const endpoints = await Promise.all(
++      results.map(result => result.summary())
++    );
++    return SuccessWithBody(res, { endpoints });
++  });
++
++  router.get(
++    `/v1/endpoints/:id(${UUID_REGEX})`,
++    [param('id').isUUID()],
++    validateArguments,
++    requiresLogin,
++    async (req, res) => {
++      const endpoint = await Endpoint.GetOne({
++        userId: req.user.id,
++        id: req.params.id,
++      });
++      if (!endpoint) return ErrorNotFound(res);
++      return SuccessWithBody(res, { endpoint: await endpoint.summary() });
++    }
++  );
++
++  router.get(
++    '/v1/endpoint_available_check',
++    [query('name').isString()],
++    validateArguments,
++    requiresLogin,
++    async (req, res) => {
++      const name = toValidSubdomain(req.query.name);
++      return SuccessWithBody(res, {
++        name,
++        available: !(await Endpoint.EndpointWithNameExists(name)),
++        url: Endpoint.NameToURL(name),
++      });
++    }
++  );
++
++  router.post(
++    '/v1/endpoints',
++    [
++      body('name').isString(),
++      body('modelId').isNumeric(),
++      body('command').isString(),
++      body('setupOptions').optional(),
++    ],
++    validateArguments,
++    requiresLogin,
++    async (req, res) => {
++      const { name, modelId, command, setupOptions } = req.body;
++      const model = await Model.findOne({ id: modelId, deleted: false });
++      if (!model) return ErrorNotFound(res);
++      const userHasPermission = await model.userHasPermission(
++        req.user.id,
++        ModelPermissionMode.Read
++      );
++      if (!userHasPermission) return ErrorPermissionDenied(res);
++      const endpoint = await Endpoint.Create({
++        name,
++        userId: req.user.id,
++        modelId: modelId,
++        command,
++        setupOptions: setupOptions || {},
++      });
++      return SuccessWithBody(res, { endpoint });
++    }
++  );
++
++  router.put(
++    `/v1/endpoints/:id(${UUID_REGEX})`,
++    [
++      param('id').isUUID(),
++      body('active')
++        .optional()
++        .isBoolean(),
++      body('private')
++        .optional()
++        .isBoolean(),
++      body('requestsPerMinuteLimit')
++        .optional()
++        .isNumeric(),
++    ],
++    validateArguments,
++    requiresLogin,
++    async (req, res) => {
++      const keys = Object.keys(req.body);
++      if (keys.length < 1) return ErrInvalidArgument(res, 'body');
++      for (const key of keys) {
++        if (!['active', 'private', 'requestsPerMinuteLimit'].includes(key))
++          return ErrInvalidArgument(res, key);
++      }
++      const endpoint = await Endpoint.GetOne(req.params.id);
++      if (!endpoint) return ErrorNotFound(res);
++      const { active, requestsPerMinuteLimit } = req.body;
++      if (typeof active !== 'undefined') {
++        if (active) await endpoint.activate();
++        else await endpoint.deactivate();
++      }
++      if (typeof req.body.private !== 'undefined') {
++        await endpoint.setPrivate(req.body.private);
++      }
++      if (typeof requestsPerMinuteLimit !== 'undefined') {
++        await endpoint.setRequestsPerMinuteLimit(requestsPerMinuteLimit);
++      }
++      await endpoint.save();
++      return Success(res);
++    }
++  );
++
++  router.post(
++    `/v1/endpoints/:id(${UUID_REGEX})/regenerate_token`,
++    [param('id').isUUID()],
++    validateArguments,
++    requiresLogin,
++    async (req, res) => {
++      const endpoint = await Endpoint.GetOne(req.params.id);
++      if (!endpoint) return ErrorNotFound(res);
++      await endpoint.generateNewToken();
++      return Success(res);
++    }
++  );
++
++  router.delete(
++    `/v1/endpoints/:id(${UUID_REGEX})`,
++    [param('id').isUUID()],
++    validateArguments,
++    requiresLogin,
++    async (req, res) => {
++      const endpoint = await Endpoint.GetOne(req.params.id);
++      if (!endpoint) return ErrorNotFound(res);
++      await endpoint.delete();
++      return Success(res);
++    }
++  );
++  // Admin routes
++
++  router.get(
++    '/v1/endpoints/lookup',
++    [query('host').isString()],
++    validateArguments,
++    async (req, res) => {
++      if (!req.hasAdminAccess) return ErrorPermissionDenied(res);
++      const { host } = req.query;
++      const hostMatch = host.match(
++        /^([a-zA-Z0-9.-]+)\.endpoints\.(stage\.){0,1}runwayml\.cloud$/
++      );
++      if (!hostMatch) return ErrInvalidArgument(res, 'host');
++      const name = hostMatch[1];
++      const endpoint = await Endpoint.GetOne({ name });
++      if (!endpoint) return ErrorNotFound(res);
++      return SuccessWithBody(res, { endpoint });
++    }
++  );
++
++  router.post(
++    `/v1/endpoints/log_requests`,
++    [body('requests').exists()],
++    validateArguments,
++    async (req, res) => {
++      if (!req.hasAdminAccess) return ErrorPermissionDenied(res);
++      const { requests } = req.body;
++      if (!(requests instanceof Array)) {
++        return ErrInvalidArgument(res, 'requests');
++      }
++      await EndpointRequests.CreateAndCharge(requests);
++      return Success(res);
++    }
++  );
++
++  // Starts a model session if none already exists that can service the endpoint, otherwise
++  // it returns the info for that one. This request is idempotent as it only starts one model
++  // session if none exist, even when called multiple times in quick succession, which is
++  // why it's a PUT instead of a POST. From the client's perspective, it is similar to a GET
++  // for the endpoint's associated model session, only it has the side effect of starting
++  // a new session if none exists.
++  router.put(
++    `/v1/endpoints/:id(${UUID_REGEX})/model_session`,
++    [param('id').isUUID()],
++    validateArguments,
++    async (req, res) => {
++      if (!req.hasAdminAccess) return ErrorPermissionDenied(res);
++      const endpoint = await Endpoint.GetOne(req.params.id);
++      if (!endpoint || !endpoint.active) {
++        return ErrorNotFound(res);
++      }
++      const {
++        modelSession,
++        coldStart,
++      } = await endpoint.ensureModelSessionExists();
++      return SuccessWithBody(res, {
++        modelSession: await modelSession.summary(
++          endpoint.userId,
++          req.appVersion
++        ),
++        coldStart,
++      });
++    }
++  );
++
++  return router;
++};
+
+diff --git a/entity/endpoints/Endpoint.ts b/entity/endpoints/Endpoint.ts
+--- a/entity/endpoints/Endpoint.ts
++++ b/entity/endpoints/Endpoint.ts
+@@ -0,0 +1,316 @@
++import * as apacheMD5 from 'apache-md5';
++import {
++  BaseEntity,
++  Column,
++  CreateDateColumn,
++  Entity,
++  FindConditions,
++  getManager,
++  In,
++  PrimaryGeneratedColumn,
++  UpdateDateColumn,
++} from 'typeorm';
++import * as uuid from 'uuid';
++
++import { InvalidArgumentError } from '../../lib/errors';
++import { createEndpointIngress, createEndpointSecret } from '../../lib/k8s';
++import { base64Decode, base64Encode, getSetting } from '../../lib/utils';
++import { Model } from '../models/Model';
++import { ModelSession, ModelSessionConfig } from '../models/ModelSession';
++import { User } from '../users/User';
++
++const COST_PER_REQUEST = 0.1;
++
++interface EndpointCreateOpts {
++  name: string;
++  userId: number;
++  modelId: number;
++  command: string;
++  setupOptions: any;
++}
++
++const REQUEST_COUNT_QUERY_TEMPLATE = (interval: string) => `
++SELECT SUM("count")
++FROM "endpoint_requests"
++WHERE
++  "endpointId" = $1
++  AND "createdAt" > (CURRENT_DATE - INTERVAL '${interval}');
++`;
++
++const ERROR_COUNT_QUERY_TEMPLATE = (interval: string) => `
++SELECT SUM("errorCount")
++FROM "endpoint_requests"
++WHERE
++  "endpointId" = $1
++  AND "createdAt" > (CURRENT_DATE - INTERVAL '${interval}');
++`;
++
++const randomToken = () => base64Encode(`${uuid().replace('-', ':', 1)}`);
++
++@Entity({ name: 'endpoints' })
++export class Endpoint extends BaseEntity {
++  @PrimaryGeneratedColumn('uuid')
++  id: string;
++
++  @Column()
++  name: string;
++
++  @CreateDateColumn()
++  createdAt: Date;
++
++  @UpdateDateColumn()
++  updatedAt: Date;
++
++  @Column()
++  modelId: number;
++
++  @Column()
++  userId: number;
++
++  @Column()
++  command: string;
++
++  @Column({ type: 'json' })
++  setupOptions: any;
++
++  @Column()
++  active: boolean;
++
++  @Column()
++  deleted: boolean;
++
++  @Column()
++  token: string;
++
++  @Column()
++  private: boolean;
++
++  @Column()
++  requestsPerMinuteLimit: number;
++
++  user() {
++    return User.GetOne(this.userId);
++  }
++
++  url() {
++    return Endpoint.NameToURL(this.name);
++  }
++
++  async generateNewToken() {
++    this.token = randomToken();
++    await this.applySecretChanges();
++    await this.applyIngressChanges();
++    await this.save();
++  }
++
++  async setPrivate(priv: boolean) {
++    this.private = priv;
++    await this.applyIngressChanges();
++    await this.save();
++  }
++
++  async setRequestsPerMinuteLimit(limit: number) {
++    if (limit < 1) this.requestsPerMinuteLimit = null;
++    else this.requestsPerMinuteLimit = limit;
++    await this.applyIngressChanges();
++    await this.save();
++  }
++
++  async activate() {
++    this.active = true;
++    await this.applyIngressChanges();
++    await this.save();
++  }
++
++  async deactivate() {
++    this.active = false;
++    await this.applyIngressChanges();
++    await this.save();
++  }
++
++  async chargeForRequests(numberOfRequests: number) {
++    const user = await this.user();
++    await user.chargeCredits(
++      'endpoint_request',
++      numberOfRequests,
++      COST_PER_REQUEST,
++      {
++        endpointId: this.id,
++      }
++    );
++    await user.reload();
++    if (user.gpuCredits < COST_PER_REQUEST) {
++      await this.deactivate();
++    }
++  }
++
++  async stats() {
++    const [
++      requestsLastHour,
++      requestsLastDay,
++      requestsLastWeek,
++      errorsLastHour,
++      errorsLastDay,
++      errorsLastWeek,
++    ] = await Promise.all([
++      getManager().query(REQUEST_COUNT_QUERY_TEMPLATE('1 hour'), [this.id]),
++      getManager().query(REQUEST_COUNT_QUERY_TEMPLATE('1 day'), [this.id]),
++      getManager().query(REQUEST_COUNT_QUERY_TEMPLATE('1 week'), [this.id]),
++      getManager().query(ERROR_COUNT_QUERY_TEMPLATE('1 hour'), [this.id]),
++      getManager().query(ERROR_COUNT_QUERY_TEMPLATE('1 day'), [this.id]),
++      getManager().query(ERROR_COUNT_QUERY_TEMPLATE('1 week'), [this.id]),
++    ]);
++    return {
++      requests: {
++        hour: requestsLastHour,
++        day: requestsLastDay,
++        week: requestsLastWeek,
++      },
++      errors: {
++        hour: errorsLastHour,
++        day: errorsLastDay,
++        week: errorsLastWeek,
++      },
++    };
++  }
++
++  async summary() {
++    const { id, name, modelId, command, setupOptions, active } = this;
++    const stats = await this.stats();
++    return {
++      id,
++      name,
++      modelId,
++      command,
++      setupOptions,
++      active,
++      stats,
++      url: this.url(),
++    };
++  }
++
++  async delete() {
++    await this.deactivate();
++    this.deleted = true;
++    await this.save();
++  }
++
++  async ensureModelSessionExists(): Promise<{
++    modelSession: ModelSession;
++    coldStart: boolean;
++  }> {
++    const model = await Model.findOne(this.modelId);
++    const modelVersion = await model.getDefaultVersion();
++    const common = {
++      modelVersionId: modelVersion.id,
++      runningStatus: In(['RUNNING', 'STARTING']),
++      trainingExperimentId: null,
++    };
++    let existingSessions = await ModelSession.find({
++      where: [
++        { ...common, shared: true },
++        { ...common, shared: false, userId: this.userId },
++      ],
++    });
++    existingSessions = existingSessions.filter(
++      sess =>
++        JSON.stringify(sess.modelOptionsValues) ===
++        JSON.stringify(this.setupOptions || {})
++    );
++
++    let modelSession;
++    let coldStart = false;
++
++    if (existingSessions.length > 0) {
++      modelSession = existingSessions[0];
++    }
++
++    if (!modelSession) {
++      const config: ModelSessionConfig = {
++        modelId: model.id,
++        modelVersionId: modelVersion.id,
++        user: this.userId,
++        modelOptions: this.setupOptions || {},
++        providerOptions: { gpuType: 'k80' },
++        shared: true,
++        endpointId: this.id,
++      };
++
++      const resp = await ModelSession.Create(config);
++      if (resp.error) {
++        throw Error(`Error creating model session: ${resp.error.message}`);
++      }
++      modelSession = resp.modelSession;
++      coldStart = true;
++    }
++
++    return {
++      modelSession,
++      coldStart,
++    };
++  }
++
++  private async applyIngressChanges() {
++    await createEndpointIngress({
++      name: this.name,
++      cluster: await getSetting('current_cluster'),
++      auth: this.private,
++      active: this.active,
++      requestsPerMinuteLimit: this.requestsPerMinuteLimit,
++    });
++  }
++
++  private async applySecretChanges() {
++    const [username, password] = base64Decode(this.token).split(':');
++    const htaccess = base64Encode(`${username}:${apacheMD5(password)}`);
++    await createEndpointSecret({
++      name: this.name,
++      htaccess,
++      cluster: await getSetting('current_cluster'),
++    });
++  }
++
++  static GetOne(opts: FindConditions<Endpoint> | string) {
++    const conditions = typeof opts === 'string' ? { id: opts } : opts;
++    return Endpoint.findOne({ ...conditions, deleted: false });
++  }
++
++  static GetMany(opts: FindConditions<Endpoint> | string) {
++    const conditions = typeof opts === 'string' ? { id: opts } : opts;
++    return Endpoint.find({ ...conditions, deleted: false });
++  }
++
++  static async Create(opts: EndpointCreateOpts) {
++    if (await this.EndpointWithNameExists(opts.name)) {
++      throw new InvalidArgumentError(
++        'Endpoint with the same name already exists.'
++      );
++    }
++    const endpoint = new Endpoint();
++    endpoint.name = opts.name;
++    endpoint.modelId = opts.modelId;
++    endpoint.userId = opts.userId;
++    endpoint.command = opts.command;
++    endpoint.setupOptions = opts.setupOptions;
++    endpoint.active = true;
++    endpoint.private = true;
++    endpoint.token = randomToken();
++    await endpoint.applySecretChanges();
++    await endpoint.applyIngressChanges();
++    await endpoint.save();
++    return endpoint;
++  }
++
++  static async EndpointWithNameExists(name: string) {
++    // Explicitly check deleted endpoints as well to prevent endpoints names from changing
++    // owners through deletion
++    const existing = await Endpoint.findOne({ name });
++    return !!existing;
++  }
++
++  static NameToURL(name: string) {
++    return process.env.STAGE === 'stage' || process.env.STAGE === 'dev'
++      ? `https://${name}.endpoints.stage.runwayml.cloud/v1/`
++      : `https://${name}.endpoints.runwayml.cloud/v1/`;
++  }
++}
+
+diff --git a/entity/endpoints/EndpointRequests.ts b/entity/endpoints/EndpointRequests.ts
+--- a/entity/endpoints/EndpointRequests.ts
++++ b/entity/endpoints/EndpointRequests.ts
+@@ -0,0 +1,105 @@
++import * as _ from 'lodash';
++import {
++  BaseEntity,
++  Column,
++  CreateDateColumn,
++  Entity,
++  In,
++  PrimaryGeneratedColumn,
++} from 'typeorm';
++
++import { InvalidArgumentError } from '../../lib/errors';
++import { isUUID } from '../../lib/utils';
++import { Endpoint } from './Endpoint';
++
++interface EndpointRequestsCreateOpts {
++  endpointId: string;
++  count: number;
++  errorCount: number;
++  coldStartCount: number;
++  totalDuration: number;
++}
++
++interface RequestLog {
++  endpointId: string;
++  errored: boolean;
++  coldStart: boolean;
++  duration: number;
++}
++
++@Entity({ name: 'endpoint_requests' })
++export class EndpointRequests extends BaseEntity {
++  @PrimaryGeneratedColumn('uuid')
++  id: string;
++
++  @Column()
++  endpointId: string;
++
++  @CreateDateColumn()
++  createdAt: Date;
++
++  @Column()
++  count: number;
++
++  @Column()
++  errorCount: number;
++
++  @Column()
++  coldStartCount: number;
++
++  @Column()
++  totalDuration: number;
++
++  static async Create(opts: EndpointRequestsCreateOpts) {
++    if (
++      typeof opts.count !== 'number' ||
++      typeof opts.errorCount !== 'number' ||
++      typeof opts.coldStartCount !== 'number' ||
++      typeof opts.totalDuration !== 'number' ||
++      !isUUID(opts.endpointId)
++    ) {
++      throw new InvalidArgumentError(
++        'Invalid property type in endpoint request object'
++      );
++    }
++    const requests = new EndpointRequests();
++    requests.endpointId = opts.endpointId;
++    requests.count = opts.count;
++    requests.errorCount = opts.errorCount;
++    requests.coldStartCount = opts.coldStartCount;
++    requests.totalDuration = opts.totalDuration;
++    await requests.save();
++    return requests;
++  }
++
++  static async CreateAndCharge(requests: RequestLog[]) {
++    const endpointRequests = [];
++    const requestsByEndpointId = _.groupBy(requests, req => req.endpointId);
++    for (const endpointId in requestsByEndpointId) {
++      const reqs = requestsByEndpointId[endpointId];
++      endpointRequests.push(
++        EndpointRequests.Create({
++          endpointId,
++          count: reqs.length,
++          errorCount: reqs
++            .filter(req => req.errored)
++            .reduce((sum, _) => sum + 1, 0),
++          coldStartCount: reqs
++            .filter(req => req.coldStart)
++            .reduce((sum, _) => sum + 1, 0),
++          totalDuration: reqs.reduce((sum, req) => sum + req.duration, 0),
++        })
++      );
++    }
++    const endpoints = await Endpoint.find({
++      id: In(Object.keys(requestsByEndpointId)),
++      deleted: false,
++    });
++    const charges = endpoints.map(endpoint => {
++      return endpoint.chargeForRequests(
++        requestsByEndpointId[endpoint.id].length
++      );
++    });
++    await Promise.all([...endpointRequests, ...charges]);
++  }
++}
+
+diff --git a/entity/models/ModelSession.ts b/entity/models/ModelSession.ts
+--- a/entity/models/ModelSession.ts
++++ b/entity/models/ModelSession.ts
+@@ -36,6 +36,7 @@ import {
+   getPriceForInstanceType,
+ } from '../../lib/utils';
+ import { getSetting } from '../../lib/utils';
++import { Endpoint } from '../endpoints/Endpoint';
+ import { Task } from '../tasks/Task';
+ import { TrainingExperiment } from '../training/TrainingExperiment';
+ import { User } from '../users/User';
+@@ -57,6 +58,7 @@ export interface ModelSessionConfig {
+   datasets?: { [key: string]: string };
+   trainingExperiment?: TrainingExperiment;
+   taskId?: string;
++  endpointId?: string;
+ }
+
+ export interface ModelSessionCreationResponse {
+@@ -145,6 +147,9 @@ export class ModelSession extends BaseEntity {
+   @Column()
+   taskId: string;
+
++  @Column()
++  endpointId: string;
++
+   getURL(): string {
+     return getModelURL(this.cluster, this.deploymentId);
+   }
+@@ -250,7 +255,7 @@ export class ModelSession extends BaseEntity {
+     let outOfCredits = false;
+     if (experiment) {
+       outOfCredits = user.gpuCredits < (await experiment.getPricePerStep());
+-    } else if (!this.taskId) {
++    } else if (!(this.taskId || this.endpointId)) {
+       outOfCredits =
+         user.gpuCredits < (await getPriceForInstanceType(this.instanceType));
+     }
+@@ -371,9 +376,9 @@ export class ModelSession extends BaseEntity {
+   }
+
+   async charge() {
+-    // If model session is associated with a task,
++    // If model session is associated with a task or endpoint,
+     // let charging be handled by the task itself.
+-    if (this.taskId) return;
++    if (this.taskId || this.endpointId) return;
+     // If model session has not started, do not charge.
+     if (!this.startedRunningAt) return;
+     const experiment = this.trainingExperimentId
+@@ -470,6 +475,7 @@ export class ModelSession extends BaseEntity {
+       training,
+       persistent,
+       shared,
++      endpointId,
+       application,
+       taskId,
+       modelId,
+@@ -557,7 +563,12 @@ export class ModelSession extends BaseEntity {
+         },
+       };
+     }
+-    if (!training && !taskId && !(await user.hasEnoughGPUCredits(gpuType))) {
++    if (
++      !training &&
++      !taskId &&
++      !endpointId &&
++      !(await user.hasEnoughGPUCredits(gpuType))
++    ) {
+       return {
+         error: {
+           status: 400,
+@@ -568,7 +579,7 @@ export class ModelSession extends BaseEntity {
+     const existingCount: number = await ModelSession.count({
+       where: { userId: user.id, runningStatus: In(['RUNNING', 'STARTING']) },
+     });
+-    if (existingCount >= user.gpuUsageLimit && !taskId) {
++    if (existingCount >= user.gpuUsageLimit && !taskId && !endpointId) {
+       return {
+         error: {
+           status: 400,
+@@ -583,15 +594,17 @@ export class ModelSession extends BaseEntity {
+         error: { status: 400, message: 'Training sessions cannot be shared.' },
+       };
+     }
+-    const deploymentId = useSharedSessions
+-      ? generateSharedDeploymentId(
+-          model.name,
+-          hash({
+-            versionId: modelVersionId,
+-            setupOptions: modelOptionsWithPaths || {},
+-          })
+-        )
+-      : generateNamedId(model.name);
++
++    const deploymentId =
++      useSharedSessions || endpointId
++        ? generateSharedDeploymentId(
++            model.name,
++            hash({
++              versionId: modelVersionId,
++              setupOptions: modelOptionsWithPaths || {},
++            })
++          )
++        : generateNamedId(model.name);
+     const gpuBuild = await version.getLatestBuildByType('gpu');
+     const dockerImageId = gpuBuild.dockerImage;
+     let coldStart = true;
+@@ -651,6 +664,7 @@ export class ModelSession extends BaseEntity {
+     session.shared = useSharedSessions || false;
+     session.application = application || null;
+     session.modelOptionsValues = modelOptions || null;
++    session.coldStart = coldStart;
+     if (config.trainingExperiment) {
+       session.trainingExperimentId = config.trainingExperiment.id;
+     }
+@@ -661,7 +675,15 @@ export class ModelSession extends BaseEntity {
+       }
+       session.taskId = taskId;
+     }
+-    session.coldStart = coldStart;
++    if (endpointId) {
++      const endpoint = await Endpoint.GetOne(endpointId);
++      if (!endpoint || endpoint.userId !== user.id) {
++        throw new InvalidArgumentError(
++          'Invalid endpoint used to start session'
++        );
++      }
++      session.endpointId = endpoint.id;
++    }
+     await session.save();
+     return {
+       modelSession: session,
+
+diff --git a/index.ts b/index.ts
+--- a/index.ts
++++ b/index.ts
+@@ -1,5 +1,5 @@
+-import './lib/env';
+ import 'reflect-metadata';
++import './lib/env';
+
+ import * as Sentry from '@sentry/node';
+ import * as bodyParser from 'body-parser';
+@@ -12,6 +12,7 @@ import { createConnection, getRepository } from 'typeorm';
+ import assetRoutes from './controllers/assets';
+ import billingRoutes from './controllers/billing';
+ import datasetRoutes from './controllers/datasets';
++import endpointRoutes from './controllers/endpoints';
+ import messageRoutes from './controllers/messages';
+ import modelBuildRoutes from './controllers/model_builds';
+ import modelSessionRoutes from './controllers/model_sessions';
+@@ -27,6 +28,8 @@ import { CouponCode } from './entity/CouponCode';
+ import { CouponCodeRedemption } from './entity/CouponCodeRedemption';
+ import { Dataset } from './entity/Dataset';
+ import { Download } from './entity/Download';
++import { Endpoint } from './entity/endpoints/Endpoint';
++import { EndpointRequests } from './entity/endpoints/EndpointRequests';
+ import { UserFeedback } from './entity/Feedback';
+ import { MessageInstance } from './entity/messages/MessageInstance';
+ import { MessageTemplate } from './entity/messages/MessageTemplate';
+@@ -185,6 +188,8 @@ export class Server {
+           Task,
+           TaskArtifact,
+           Upload,
++          Endpoint,
++          EndpointRequests,
+         ],
+         logging: false,
+       });
+@@ -299,14 +304,17 @@ export class Server {
+     this.express.use('/', messageRoutes());
+     this.express.use('/', taskRoutes());
+     this.express.use('/', uploadRoutes());
++    this.express.use('/', endpointRoutes());
+     this.express.use('/', assetRoutes());
+     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+     this.express.use((err, _, res, _2) => {
+       console.error(err.stack);
+       Sentry.captureException(err);
+-      res.status(500).json({
+-        error: 'Internal server error',
+-      });
++      if (!res.headersSent) {
++        res.status(500).json({
++          error: 'Internal server error',
++        });
++      }
+     });
+   }
+ }
+
+diff --git a/lib/k8s.ts b/lib/k8s.ts
+--- a/lib/k8s.ts
++++ b/lib/k8s.ts
+@@ -22,6 +22,7 @@ import {
+ const USER_RESOURCE_AWS_SECRET = 'aws-secret';
+ const USER_RESOURCE_NETWORK_POLICY =
+   'deny-inbound-from-all-except-nginx-ingress';
++const ENDPOINTS_NAMESPACE = 'endpoints';
+
+ export const getK8sAPIURL = (cluster: string) => {
+   // Legacy
+@@ -50,7 +51,7 @@ const getIngressEndpoint = (namespace: string) => {
+   return `/apis/extensions/v1beta1/namespaces/${namespace}/ingresses`;
+ };
+
+-const getAWSBuildUserSecretEndpoint = (namespace: string) => {
++const getSecretEndpoint = (namespace: string) => {
+   return `/api/v1/namespaces/${namespace}/secrets`;
+ };
+
+@@ -252,6 +253,77 @@ const generateUserIngress = (namespace: string) => ({
+   },
+ });
+
++const generateEndpointIngress = (config: CreateEndpointIngressOptions) => {
++  const manifest = {
++    apiVersion: 'extensions/v1beta1',
++    kind: 'Ingress',
++    metadata: {
++      name: config.name,
++      namespace: ENDPOINTS_NAMESPACE,
++      annotations: {
++        'kubernetes.io/ingress.class': 'nginx',
++        'nginx.ingress.kubernetes.io/rewrite-target': '/$1',
++        'nginx.ingress.kubernetes.io/enable-cors': 'true',
++        'nginx.ingress.kubernetes.io/proxy-body-size': '0',
++        'nginx.ingress.kubernetes.io/proxy-connect-timeout': '600',
++        'nginx.ingress.kubernetes.io/proxy-read-timeout': '600',
++        'nginx.ingress.kubernetes.io/proxy-send-timeout': '600',
++        'nginx.ingress.kubernetes.io/connection-proxy-header': 'keep-alive',
++        'nginx.ingress.kubernetes.io/proxy-next-upstream-timeout': '600',
++      },
++      labels: {
++        'runwayml.com/endpoint-active': `${config.active}`,
++      },
++    },
++    spec: {
++      rules: [
++        {
++          host:
++            process.env.STAGE === 'stage' || process.env.STAGE === 'dev'
++              ? `${config.name}.endpoints.stage.runwayml.cloud`
++              : `${config.name}.endpoints.runwayml.cloud`,
++          http: {
++            paths: [
++              {
++                path: '/?(.*)',
++                backend: {
++                  serviceName: 'endpoints-microservice',
++                  servicePort: 80,
++                },
++              },
++            ],
++          },
++        },
++      ],
++    },
++  };
++  if (config.active) {
++    if (config.auth) {
++      manifest.metadata.annotations['nginx.ingress.kubernetes.io/auth-type'] =
++        'basic';
++      manifest.metadata.annotations['nginx.ingress.kubernetes.io/auth-secret'] =
++        config.name;
++      manifest.metadata.annotations[
++        'nginx.ingress.kubernetes.io/auth-secret-type'
++      ] = 'auth-file';
++      manifest.metadata.annotations['nginx.ingress.kubernetes.io/auth-realm'] =
++        'endpoints';
++    }
++    if (config.requestsPerMinuteLimit) {
++      manifest.metadata.annotations['nginx.ingress.kubernetes.io/limit-rpm'] =
++        config.requestsPerMinuteLimit;
++    }
++  } else {
++    manifest.metadata.annotations[
++      'nginx.ingress.kubernetes.io/server-snippet'
++    ] = `
++    default_type application/json;
++    return 404 '{"error": "Not Found"}';
++    `;
++  }
++  return manifest;
++};
++
+ // Creates a NetworkPolicy that denies all Ingress traffic from other namespaces
+ const generateNetworkPolicy = (namespace: string) => ({
+   kind: 'NetworkPolicy',
+@@ -298,6 +370,19 @@ const generateAWSBuildUserSecret = (namespace: string) => {
+   };
+ };
+
++const generateEndpointSecret = (config: CreateEndpointSecretOptions) => ({
++  kind: 'Secret',
++  apiVersion: 'v1',
++  data: {
++    auth: config.htaccess,
++  },
++  metadata: {
++    name: config.name,
++    namespace: ENDPOINTS_NAMESPACE,
++  },
++  type: 'Opaque',
++});
++
+ interface GenerateServiceOpts {
+   deploymentId: string;
+   namespace: string;
+@@ -934,9 +1019,7 @@ const createUserIngress = async (cluster: string, namespace: string) => {
+
+ const createAWSBuildUserSecret = async (cluster: string, namespace: string) => {
+   console.log(`Creating AWS build user Secret...`);
+-  const uri = `${getK8sAPIURL(cluster)}${getAWSBuildUserSecretEndpoint(
+-    namespace
+-  )}`;
++  const uri = `${getK8sAPIURL(cluster)}${getSecretEndpoint(namespace)}`;
+   const manifest = generateAWSBuildUserSecret(namespace);
+   await createResource(cluster, uri, manifest);
+ };
+@@ -953,6 +1036,42 @@ export const createConfigMap = async (
+   await createResource(cluster, uri, manifest);
+ };
+
++export interface CreateEndpointIngressOptions {
++  name: string;
++  active: boolean;
++  auth?: boolean;
++  requestsPerMinuteLimit?: number;
++  cluster?: string;
++}
++export const createEndpointIngress = async (
++  config: CreateEndpointIngressOptions
++) => {
++  console.log(`Creating endpoint Ingress ${config.name}...`);
++  const uri = `${getK8sAPIURL(config.cluster)}${getIngressEndpoint(
++    ENDPOINTS_NAMESPACE
++  )}`;
++  const manifest = generateEndpointIngress(config);
++  await removeResource(config.cluster, uri);
++  await createResource(config.cluster, uri, manifest);
++};
++
++export interface CreateEndpointSecretOptions {
++  name: string;
++  htaccess: string;
++  cluster?: string;
++}
++export const createEndpointSecret = async (
++  config: CreateEndpointSecretOptions
++) => {
++  console.log(`Creating endpoint secret ${config.name}...`);
++  const uri = `${getK8sAPIURL(config.cluster)}${getSecretEndpoint(
++    ENDPOINTS_NAMESPACE
++  )}`;
++  const manifest = generateEndpointSecret(config);
++  await removeResource(config.cluster, uri);
++  await createResource(config.cluster, uri, manifest);
++};
++
+ export const updateConfigMap = async (
+   cluster: string,
+   namespace: string,
+
+diff --git a/lib/utils.ts b/lib/utils.ts
+--- a/lib/utils.ts
++++ b/lib/utils.ts
+@@ -293,6 +293,12 @@ export const sleep = duration => {
+   });
+ };
+
++export const isUUID = (candidate: string) => {
++  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
++    candidate
++  );
++};
++
+ export const download = (url: string): Promise<Stream> => {
+   return new Promise((resolve, reject) => {
+     const request = https.get(url, response => {
+@@ -318,3 +324,24 @@ export const appendEnvToName = (name: string) => {
+     return `${name}-prod`;
+   }
+ };
++
++export const base64Encode = (data: string) =>
++  Buffer.from(data).toString('base64');
++
++export const base64Decode = (data: string) =>
++  Buffer.from(data, 'base64').toString('utf-8');
++
++// Note this implementation replaces . with -, even though . is a valid character in subdomains
++export const toValidSubdomain = (input: string) => {
++  // DNS is case insensitive, but we convert to lowercase for style
++  let output = input.toLowerCase();
++  // subdomains may contain alphanumeric characters and dashes only (we disallow "." to
++  // prevent ambiguity even though it's allowed in the spec)
++  output = output.replace(/[^a-zA-Z0-9/-]/g, '-');
++  // subdomains must begin and end with alphanumeric characters
++  output = output.replace(/^-/, '1-');
++  output = output.replace(/-$/, '-1');
++  if (output === '') return '1';
++  // subdomains must be no more than 63 characters
++  return output.substring(0, 63);
++};
+
+diff --git a/migrations/1582828647734-CreateEndpointsTable.ts b/migrations/1582828647734-CreateEndpointsTable.ts
+--- a/migrations/1582828647734-CreateEndpointsTable.ts
++++ b/migrations/1582828647734-CreateEndpointsTable.ts
+@@ -0,0 +1,34 @@
++import { MigrationInterface, QueryRunner } from 'typeorm';
++
++export class CreateEndpointsTable1582828647734 implements MigrationInterface {
++  public async up(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(`
++        CREATE TABLE "endpoints"
++        ("id" uuid NOT NULL DEFAULT uuid_generate_v4(),
++        "name" varchar NOT NULL,
++        "createdAt" TIMESTAMP NOT NULL DEFAULT now(),
++        "updatedAt" TIMESTAMP NOT NULL DEFAULT now(),
++        "modelId" integer NOT NULL REFERENCES "models" ("id"),
++        "userId" integer NOT NULL REFERENCES "users" ("id"),
++        "command" varchar NOT NULL,
++        "setupOptions" json NOT NULL,
++        "active" boolean NOT NULL DEFAULT false,
++        "deleted" boolean NOT NULL DEFAULT false,
++        CONSTRAINT "PRIMARY_KEY_ENDPOINT_ID" PRIMARY KEY ("id"))`);
++
++    await queryRunner.query(`
++        CREATE TABLE "endpoint_requests"
++        ("id" uuid NOT NULL DEFAULT uuid_generate_v4(),
++        "endpointId" uuid NOT NULL REFERENCES "endpoints" ("id"),
++        "createdAt" TIMESTAMP NOT NULL DEFAULT now(),
++        "coldStart" boolean NOT NULL,
++        "duration" int8 NOT NULL,
++        "errored" boolean NOT NULL,
++        CONSTRAINT "PRIMARY_KEY_ENDPOINT_REQUEST_ID" PRIMARY KEY ("id"))`);
++  }
++
++  public async down(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(`DROP TABLE "endpoints"`);
++    await queryRunner.query(`DROP TABLE "endpoint_requests"`);
++  }
++}
+
+diff --git a/migrations/1585317800897-EndpointRequestEdits.ts b/migrations/1585317800897-EndpointRequestEdits.ts
+--- a/migrations/1585317800897-EndpointRequestEdits.ts
++++ b/migrations/1585317800897-EndpointRequestEdits.ts
+@@ -0,0 +1,37 @@
++import { MigrationInterface, QueryRunner } from 'typeorm';
++
++export class EndpointRequestEdits1585317800897 implements MigrationInterface {
++  public async up(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(`
++        ALTER TABLE "endpoint_requests"
++        DROP COLUMN "coldStart",
++        DROP COLUMN "duration",
++        DROP COLUMN "errored";
++    `);
++
++    await queryRunner.query(`
++        ALTER TABLE "endpoint_requests"
++        ADD COLUMN "count" integer NOT NULL,
++        ADD COLUMN "errorCount" integer NOT NULL,
++        ADD COLUMN "coldStartCount" integer NOT NULL,
++        ADD COLUMN "totalDuration" integer NOT NULL;
++    `);
++  }
++
++  public async down(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(`
++        ALTER TABLE "endpoint_requests"
++        DROP COLUMN "count",
++        DROP COLUMN "errorCount",
++        DROP COLUMN "coldStartCount",
++        DROP COLUMN "totalDuration";
++    `);
++
++    await queryRunner.query(`
++        ALTER TABLE "endpoint_requests"
++        ADD COLUMN "coldStart" boolean NOT NULL,
++        ADD COLUMN "duration" int8 NOT NULL,
++        ADD COLUMN "errored" boolean NOT NULL;
++    `);
++  }
++}
+
+diff --git a/migrations/1585583210782-CreateIndexOnEndpointsName.ts b/migrations/1585583210782-CreateIndexOnEndpointsName.ts
+--- a/migrations/1585583210782-CreateIndexOnEndpointsName.ts
++++ b/migrations/1585583210782-CreateIndexOnEndpointsName.ts
+@@ -0,0 +1,14 @@
++import { MigrationInterface, QueryRunner } from 'typeorm';
++
++export class CreateIndexOnEndpointsName1585583210782
++  implements MigrationInterface {
++  public async up(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(
++      `CREATE INDEX "ENDPOINTS_NAME" ON "endpoints" ("name")`
++    );
++  }
++
++  public async down(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(`DROP INDEX "ENDPOINTS_NAME"`);
++  }
++}
+
+diff --git a/migrations/1585854891300-AddModelSessionEndpointIdColumn.ts b/migrations/1585854891300-AddModelSessionEndpointIdColumn.ts
+--- a/migrations/1585854891300-AddModelSessionEndpointIdColumn.ts
++++ b/migrations/1585854891300-AddModelSessionEndpointIdColumn.ts
+@@ -0,0 +1,16 @@
++import { MigrationInterface, QueryRunner } from 'typeorm';
++
++export class AddModelSessionEndpointIdColumn1585854891300
++  implements MigrationInterface {
++  public async up(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(
++      `ALTER TABLE "model_sessions" ADD COLUMN "endpointId" uuid DEFAULT NULL REFERENCES "endpoints" ("id")`
++    );
++  }
++
++  public async down(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(
++      `ALTER TABLE "model_sessions" DROP COLUMN "endpointId";`
++    );
++  }
++}
+
+diff --git a/migrations/1585941023975-AddSecurityColumnsToEndpointsTable.ts b/migrations/1585941023975-AddSecurityColumnsToEndpointsTable.ts
+--- a/migrations/1585941023975-AddSecurityColumnsToEndpointsTable.ts
++++ b/migrations/1585941023975-AddSecurityColumnsToEndpointsTable.ts
+@@ -0,0 +1,26 @@
++import { MigrationInterface, QueryRunner } from 'typeorm';
++
++export class AddSecurityColumnsToEndpointsTable1585941023975
++  implements MigrationInterface {
++  public async up(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(
++      `ALTER TABLE "endpoints" ADD COLUMN "token" varchar NOT NULL`
++    );
++
++    await queryRunner.query(
++      `ALTER TABLE "endpoints" ADD COLUMN "private" boolean DEFAULT TRUE`
++    );
++
++    await queryRunner.query(
++      `ALTER TABLE "endpoints" ADD COLUMN "requestsPerMinuteLimit" numeric`
++    );
++  }
++
++  public async down(queryRunner: QueryRunner): Promise<any> {
++    await queryRunner.query(`ALTER TABLE "endpoints" DROP COLUMN "token";`);
++    await queryRunner.query(`ALTER TABLE "endpoints" DROP COLUMN "private";`);
++    await queryRunner.query(
++      `ALTER TABLE "endpoints" DROP COLUMN "requestsPerMinuteLimit";`
++    );
++  }
++}
+
+diff --git a/package-lock.json b/package-lock.json
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1431,6 +1431,11 @@
+             "picomatch": "^2.0.4"
+          }
+       },
++      "apache-md5": {
++         "version": "1.1.5",
++         "resolved": "https://registry.npmjs.org/apache-md5/-/apache-md5-1.1.5.tgz",
++         "integrity": "sha512-sbLEIMQrkV7RkIruqTPXxeCMkAAycv4yzTkBzRgOR1BrR5UB7qZtupqxkersTJSf0HZ3sbaNRrNV80TnnM7cUw=="
++      },
+       "app-root-path": {
+          "version": "3.0.0",
+          "resolved": "https://registry.npmjs.org/app-root-path/-/app-root-path-3.0.0.tgz",
+
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -20,6 +20,7 @@
+     "migrations-dev": "STAGE=dev npm run typeorm -- migration:run",
+     "migrations-stage": "STAGE=stage npm run typeorm -- migration:run",
+     "migrations-prod": "STAGE=production npm run typeorm -- migration:run",
++    "create-migration": "npm run typeorm -- migrations:create -d migrations -n",
+     "deploy-prod": "serverless deploy --stage production --env production -v --aws-s3-accelerate",
+     "deploy-stage": "serverless deploy --stage stage --env stage -v",
+     "deploy-stage-api": "bash scripts/manage_stage_apis.sh deploy",
+@@ -54,6 +55,7 @@
+     "@google-cloud/bigquery": "^4.7.0",
+     "@octokit/rest": "^16.23.3",
+     "@sentry/node": "^5.2.0",
++    "apache-md5": "^1.1.5",
+     "aws-sdk": "^2.377.0",
+     "body-parser": "^1.18.3",
+     "class-validator": "^0.9.1",
+
+diff --git a/tests/unit/utils.ts b/tests/unit/utils.ts
+--- a/tests/unit/utils.ts
++++ b/tests/unit/utils.ts
+@@ -0,0 +1,46 @@
++import { assert } from 'chai';
++
++import { toValidSubdomain } from '../../lib/utils';
++
++describe('unit/utils', async function() {
++  describe('isValidSubdomain()', async function() {
++    // Technically '.'s are allowed in subomains, but our isValidSubdomain() function replaces
++    // them with '-' to make the subdomains unambiguous
++    it('should properly convert invalid subdomains to valid subdomains', function() {
++      assert.equal(
++        toValidSubdomain('!my!Cool!subdomain'),
++        '1-my-cool-subdomain'
++      );
++
++      assert.equal(
++        toValidSubdomain('-This.isnt.allowed'),
++        '1-this-isnt-allowed'
++      );
++
++      assert.equal(
++        toValidSubdomain('this.also.isnt.allowed-'),
++        'this-also-isnt-allowed-1'
++      );
++
++      assert.equal(toValidSubdomain('@example'), '1-example');
++      assert.equal(toValidSubdomain('ex@mple'), 'ex-mple');
++
++      assert.equal(
++        toValidSubdomain(
++          'way-to-long-111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111'
++        ),
++        'way-to-long-111111111111111111111111111111111111111111111111111'
++      );
++
++      assert.equal(toValidSubdomain('VALID.subdomain'), 'valid-subdomain');
++      assert.equal(toValidSubdomain('something.com'), 'something-com');
++    });
++
++    it('should leave valid subdomains to valid, but convert them to lowercase', function() {
++      assert.equal(toValidSubdomain('example'), 'example');
++      assert.equal(toValidSubdomain('Example'), 'example');
++      assert.equal(toValidSubdomain('valid-SUBDOMAIN'), 'valid-subdomain');
++      assert.equal(toValidSubdomain('valid---subdomain'), 'valid---subdomain');
++    });
++  });
++});
